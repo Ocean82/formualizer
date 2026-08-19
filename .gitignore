@@ -3,11 +3,14 @@ proptest-regressions/
 **/.claude/settings.local.json
 repomix-output.xml
 *.md
+.my_docs/
 !README.md
 !SPEC.md
 !CHANGELOG.md
 !docs/**
 opencode.json
+.vscode/
+docs/superpowers/
 
 *coverage*
 !tests/formula_tests/extended_coverage.json
