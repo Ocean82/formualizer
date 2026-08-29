@@ -1780,6 +1780,18 @@ class Workbook:
             print(wb.evaluate_cell("Data", 3, 1))
         ```
         """
+    def set_deterministic_clock(self, deterministic_timestamp_utc: datetime.datetime, deterministic_timezone: typing.Optional[typing.Any] = None) -> None:
+        r"""
+        Pin the evaluation clock to a caller-supplied instant, so the
+        volatile date/time builtins (TODAY, NOW) evaluate deterministically
+        on the next recalculation. Takes effect on a live workbook; no
+        reload is required.
+        
+        `deterministic_timezone` accepts `"utc"`, `"local"`, or a fixed
+        offset in seconds — the same spelling as
+        `SheetPortSession.evaluate_once(deterministic_timezone=...)`.
+        Omitted means UTC.
+        """
     def evaluate_all(self) -> None: ...
     def last_cycle_telemetry(self) -> CycleTelemetry:
         r"""
@@ -1810,6 +1822,10 @@ class Workbook:
     def get_eval_plan(self, targets: list, *, build_graph_if_needed: builtins.bool = True) -> EvaluationPlan: ...
     def cancel(self) -> None: ...
     def reset_cancel(self) -> None: ...
+    def set_temporal_egress(self, policy: builtins.str) -> None:
+        r"""
+        Choose temporal output as native Python datetime values (default) or floats.
+        """
     def get_value(self, sheet: builtins.str, row: builtins.int, col: builtins.int) -> typing.Optional[typing.Any]: ...
     def get_formula(self, sheet: builtins.str, row: builtins.int, col: builtins.int) -> typing.Optional[builtins.str]: ...
     def set_changelog_enabled(self, enabled: builtins.bool) -> None: ...

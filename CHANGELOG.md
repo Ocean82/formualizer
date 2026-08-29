@@ -4,6 +4,30 @@ All notable changes to Formualizer will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- FormulaPlane correctness now covers mixed-pass named-symbol scheduling with dynamic fail-closed preflight, format preservation across broadcast and computed-overlay writeback, transactional demotion of retained spans before Off-mode legacy evaluation without FormulaPlane dispatch, and dependent healing after name redefinition.
+- FormulaPlane now admits `IF`, `IFS`, and `CHOOSE` spans when every result arm is a single cell or a statically scalar expression. Range, open-range, named, volatile, and dynamic-reference arms remain on the legacy path.
+- Named-range definitions now track structural inserts and deletes like all other references; previously they stayed pinned to their original coordinates. Deleting a band containing a name target now invalidates the definition to `#REF!`. (#170)
+- Computed temporals are numeric during evaluation (`ISNUMBER`/`TYPE` now match Excel). Native scalar, range, table, Python, and SheetPort egress materializes date/time values from the cell's effective format; callers can opt into uniform raw serials. A known datetime class preserves midnight datetimes, while calamine's code-lossy date-ish signal can only classify pure fractions as time, day-plus-fraction serials as datetime, and integers as date.
+- Arrow dependencies upgraded 58.2 → 59.2 across `formualizer-eval` (`arrow`, `arrow-array`, `arrow-buffer`, `arrow-schema`, `arrow-select`, `arrow-cast`). No API or behaviour change; full suite green on the pinned surface, native and wasm32.
+
+### Fixed
+
+- SheetPort ports now coerce temporal values to the manifest-declared type at the port boundary: `number`/`integer` ports receive serials regardless of the engine's `TemporalEgress` policy, and `date`/`datetime` ports receive native temporals; the manifest is the protocol contract, engine egress is only a default.
+- Date arithmetic no longer conditionally propagates `LiteralValue::Date`; a position-keyed, non-sticky scalar format annotation carries temporal display class independently, fixing #312 without exposing annotations to bulk numeric kernels. Date-plus-time yields datetime, date-plus-percent and date-plus-plain-number yield date, and unspecified class pairs drop the annotation. Selection functions preserve the chosen scalar annotation, including `IFERROR`, `IFNA`, and scalar-argument `MAX`/`MIN`; `MAX`/`MIN` over multi-cell ranges do not yet recover the winning cell's format.
+- Before merge, the unreleased format channel was hardened so row, column, and sheet structural edits purge affected derived-format positions, and value/formula writes invalidate format state in both ephemeral and interactive/changelog modes. This prevents shifted plain values and logged overwrites from inheriting stale temporal formats; neither pre-merge regression shipped.
+- Temporal values saved through `Workbook::to_xlsx_bytes` round-trip as date-system-aware numeric serials instead of text, restoring arithmetic while leaving display and number-format fidelity to the format channel. (#355)
+
+- Structural row inserts and deletes now invalidate compressed open-range readers when the edited axis intersects and an indexed occupied column crosses the range. Bounded formulas whose AST is adjusted remain conservatively dirtied, and column edits retain conservative cross-axis invalidation because Arrow has no cheap occupied-row index. (#313, #314)
+- **A structural edit no longer reaches a defined name, table or external source.** Those three, plus sheet-scoped names, are identified by name and have no position on any sheet, but the graph gave them fabricated grid coordinates on a real user-visible sheet: the first workbook name landed on `Sheet1!$A$1`, the second on `$B$1`, and a table on its range's anchor cell. The only thing separating such a vertex from the actual cell at that address was its deliberate absence from the cell index — a convention, not a structural property. Two code paths broke it, and both are fixed by giving symbols their own address space. (#302, #304)
+
+  A **default-sheet row or column insert** shifted a name's vertex onto an addressable cell *and* published it in the cell index at the new address. Every dependency resolved afterwards against that address then bound to the name instead of the cell. Three consequences followed, each measured against a matched control that varied only the insert row: a formula written later as `=A2+1` acquired `deps == ["NamedScalar@Sheet1!$A$2"]` rather than a direct cell edge, so editing the *name's* target dirtied an unrelated default-sheet formula; an ordinary data write at the hijacked address rewrote the name's own vertex from `NamedScalar` to `Cell`, silently destroying the name while `resolve_name_entry` kept returning it; and deleting the row the vertex then occupied stranded the name, after which `=Tracked+1` served `71` where `701` was correct. The same happened for sheet-scoped names, for tables, for expanded ranges that merely *covered* the address, and for the vertex's later positions after repeated inserts. (#304)
+
+  A **structural edit on a completely unrelated sheet** dropped formula→name edges. Deleting row 1 or column 1 of the default sheet swept up any name vertex parked at `$A$1` as an ordinary resident of that row or column and deleted it, taking its edges with it — even when both the formula and the name's target lived on another sheet entirely. Subsequent changes to the name's target no longer dirtied the formula, which then served silently stale values. (#302)
+
+  Symbol vertices now hold a `SymbolAddr` in an address space disjoint from the grid's, and the structures keyed by position — the cell index, the per-sheet range index, and the iteration that drives every structural edit — accept a `GridAddr`, which a symbol cannot produce. `NameScope` is now purely lookup metadata and no longer decides where a vertex lives. Evaluation results are unchanged; a name's scope, resolution and dirty propagation all behave exactly as before.
+
 ## [0.8.4] - 2026-08-14
 
 ### Changed

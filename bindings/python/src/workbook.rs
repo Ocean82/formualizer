@@ -851,6 +851,34 @@ impl PyWorkbook {
         literal_to_py(py, &v)
     }
 
+    /// Pin the evaluation clock to a caller-supplied instant, so the
+    /// volatile date/time builtins (TODAY, NOW) evaluate deterministically
+    /// on the next recalculation. Takes effect on a live workbook; no
+    /// reload is required.
+    ///
+    /// `deterministic_timezone` accepts `"utc"`, `"local"`, or a fixed
+    /// offset in seconds — the same spelling as
+    /// `SheetPortSession.evaluate_once(deterministic_timezone=...)`.
+    /// Omitted means UTC.
+    #[pyo3(signature = (deterministic_timestamp_utc, deterministic_timezone=None))]
+    pub fn set_deterministic_clock(
+        &self,
+        deterministic_timestamp_utc: chrono::DateTime<chrono::Utc>,
+        deterministic_timezone: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let timezone = match deterministic_timezone {
+            Some(obj) => crate::sheetport::parse_timezone_spec(obj)?,
+            None => formualizer::eval::timezone::TimeZoneSpec::Utc,
+        };
+        let mut wb = self.write_inner()?;
+        wb.set_deterministic_mode(formualizer::eval::engine::DeterministicMode::Enabled {
+            timestamp_utc: deterministic_timestamp_utc,
+            timezone,
+        })
+        .map_err(workbook_error_to_pyerr)?;
+        Ok(())
+    }
+
     pub fn evaluate_all(&self, py: Python<'_>) -> PyResult<()> {
         // Ensure flag is reset before starting
         self.cancel_flag
@@ -971,6 +999,22 @@ impl PyWorkbook {
     pub fn reset_cancel(&self) {
         self.cancel_flag
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Choose temporal output as native Python datetime values (default) or floats.
+    pub fn set_temporal_egress(&self, policy: &str) -> PyResult<()> {
+        let policy = match policy.to_ascii_lowercase().as_str() {
+            "native" => formualizer::eval::engine::TemporalEgress::Native,
+            "serial" => formualizer::eval::engine::TemporalEgress::Serial,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "temporal egress must be 'native' or 'serial'",
+                ));
+            }
+        };
+        self.write_inner()?.engine_mut().set_temporal_egress(policy);
+        self.sheets.write().unwrap().clear();
+        Ok(())
     }
 
     pub fn get_value(

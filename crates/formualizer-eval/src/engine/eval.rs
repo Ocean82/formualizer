@@ -45,16 +45,16 @@ use crate::formula_plane::placement::{
 };
 use crate::formula_plane::producer::{
     DirtyProjectionRule, FormulaConsumerReadIndex, FormulaProducerId, FormulaProducerResultIndex,
-    FormulaProducerWork, ProducerDirtyDomain, SpanReadSummary,
+    FormulaProducerWork, ProducerDirtyDomain, ProjectionResult, SpanReadSummary,
 };
-use crate::formula_plane::region_index::{DirtyDomain, Region};
+use crate::formula_plane::region_index::{BoundedRegionQueryResult, DirtyDomain, Region};
 use crate::formula_plane::runtime::{
     FormulaPlane, FormulaSpanId, FormulaSpanRef, PlacementCoord, PlacementDomain, ResultRegion,
 };
 use crate::formula_plane::scheduler::{
-    MixedSchedule, MixedScheduleFallbackReason, MixedTopology, MixedTopologyCompileResult,
-    MixedTopologyCompileStats, MixedTopologyConfig, build_demand_closure_cached,
-    build_demand_closure_in_memory_runs, build_demand_closure_paged,
+    MixedLayer, MixedSchedule, MixedScheduleFallback, MixedScheduleFallbackReason, MixedTopology,
+    MixedTopologyCompileResult, MixedTopologyCompileStats, MixedTopologyConfig,
+    build_demand_closure_cached, build_demand_closure_in_memory_runs, build_demand_closure_paged,
     build_demand_closure_repeated_passes, compile_mixed_topology, schedule_dirty_work,
     schedule_dirty_work_in_memory_runs, schedule_dirty_work_paged_hybrid,
     schedule_dirty_work_repeated_passes,
@@ -662,6 +662,7 @@ pub(crate) enum ComputedWrite {
         row0: u32,
         col0: u32,
         value: OverlayValue,
+        format_id: Option<crate::format::FormatId>,
     },
     Rect {
         seq: u64,
@@ -669,6 +670,7 @@ pub(crate) enum ComputedWrite {
         sr0: u32,
         sc0: u32,
         values: Vec<Vec<OverlayValue>>,
+        formats: Vec<Vec<Option<crate::format::FormatId>>>,
     },
 }
 
@@ -718,6 +720,17 @@ impl ComputedWriteBuffer {
         col0: u32,
         value: OverlayValue,
     ) {
+        self.push_cell_with_format(sheet_id, row0, col0, value, None);
+    }
+
+    pub(crate) fn push_cell_with_format(
+        &mut self,
+        sheet_id: SheetId,
+        row0: u32,
+        col0: u32,
+        value: OverlayValue,
+        format_id: Option<crate::format::FormatId>,
+    ) {
         let seq = self.next_sequence();
         self.estimated_bytes = self
             .estimated_bytes
@@ -728,6 +741,7 @@ impl ComputedWriteBuffer {
             row0,
             col0,
             value,
+            format_id,
         });
     }
 
@@ -745,12 +759,14 @@ impl ComputedWriteBuffer {
             .map(Self::estimate_value_bytes)
             .fold(0usize, usize::saturating_add);
         self.estimated_bytes = self.estimated_bytes.saturating_add(added);
+        let formats = values.iter().map(|row| vec![None; row.len()]).collect();
         self.writes.push(ComputedWrite::Rect {
             seq,
             sheet_id,
             sr0,
             sc0,
             values,
+            formats,
         });
     }
 
@@ -789,6 +805,7 @@ pub(crate) struct ComputedWriteChunkEntryPlan {
     pub(crate) row_in_chunk: usize,
     pub(crate) seq: u64,
     pub(crate) value: OverlayValue,
+    pub(crate) format_id: Option<crate::format::FormatId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -936,6 +953,12 @@ pub struct Engine<R> {
     spill_mgr: ShimSpillManager,
     /// Arrow-backed storage for sheet values (Phase A)
     arrow_sheets: SheetStore,
+    /// Workbook-local number-format registry.
+    format_registry: crate::format::FormatRegistry,
+    /// Thread-safe handoff from immutable/parallel evaluation to overlay apply.
+    derived_format_results: std::sync::RwLock<FxHashMap<VertexId, Option<crate::format::FormatId>>>,
+    /// Derived formula formats keyed by grid position, never graph vertex identity.
+    derived_formats: std::sync::RwLock<FxHashMap<CellRef, crate::format::FormatId>>,
     /// True if any edit after bulk load; disables Arrow reads for parity
     has_edited: bool,
     /// Overlay compaction counter (Phase C instrumentation)
@@ -1500,6 +1523,7 @@ where
 
             let sheet_id = self.engine.graph.sheet_id_mut(sheet);
             let before0 = before.saturating_sub(1);
+            let occupancy = self.engine.structural_row_occupancy(sheet, sheet_id);
             let affected_region = Engine::<R>::structural_row_region(sheet_id, before0);
             // Authority geometry is not journaled. Materialize affected spans
             // before the logged graph shift so undo/redo remains exact instead
@@ -1513,6 +1537,7 @@ where
                 let mut out: Result<crate::engine::ShiftSummary, crate::engine::EditorError> =
                     Ok(crate::engine::ShiftSummary::default());
                 self.engine.edit_with_logger(log, |editor| {
+                    editor.set_structural_occupancy(occupancy);
                     out = editor.insert_rows(sheet_id, before0, count);
                 })?;
                 out?
@@ -1523,6 +1548,8 @@ where
             if let Some(asheet) = self.engine.arrow_sheets.sheet_mut(sheet) {
                 asheet.insert_rows(before0 as usize, count as usize);
             }
+            self.engine
+                .purge_derived_formats_after_row(sheet_id, before0);
             self.engine
                 .shift_row_visibility_insert(sheet_id, before0, count);
             self.engine.mark_moved_formula_vertices_dirty(&summary);
@@ -1579,6 +1606,7 @@ where
 
             let sheet_id = self.engine.graph.sheet_id_mut(sheet);
             let before0 = before.saturating_sub(1);
+            let occupancy = self.engine.structural_column_occupancy();
             let affected_region = Engine::<R>::structural_col_region(sheet_id, before0);
             self.engine
                 .demote_spans_preserving_computed_overlays(sheet_id, affected_region)?;
@@ -1588,6 +1616,7 @@ where
                 let mut out: Result<crate::engine::ShiftSummary, crate::engine::EditorError> =
                     Ok(crate::engine::ShiftSummary::default());
                 self.engine.edit_with_logger(log, |editor| {
+                    editor.set_structural_occupancy(occupancy);
                     out = editor.insert_columns(sheet_id, before0, count);
                 })?;
                 out?
@@ -1597,6 +1626,8 @@ where
             if let Some(asheet) = self.engine.arrow_sheets.sheet_mut(sheet) {
                 asheet.insert_columns(before0 as usize, count as usize);
             }
+            self.engine
+                .purge_derived_formats_after_col(sheet_id, before0);
             self.engine.mark_moved_formula_vertices_dirty(&summary);
             self.engine
                 .clear_computed_overlay_after_col(sheet, before0 as usize);
@@ -2602,6 +2633,9 @@ where
             mixed_topology_cache_skip_streak: 0,
             spill_mgr: ShimSpillManager::default(),
             arrow_sheets: SheetStore::default(),
+            format_registry: crate::format::FormatRegistry::default(),
+            derived_format_results: std::sync::RwLock::new(FxHashMap::default()),
+            derived_formats: std::sync::RwLock::new(FxHashMap::default()),
             has_edited: false,
             overlay_compactions: 0,
             computed_overlay_bytes_estimate: 0,
@@ -2742,6 +2776,9 @@ where
             mixed_topology_cache_skip_streak: 0,
             spill_mgr: ShimSpillManager::default(),
             arrow_sheets: SheetStore::default(),
+            format_registry: crate::format::FormatRegistry::default(),
+            derived_format_results: std::sync::RwLock::new(FxHashMap::default()),
+            derived_formats: std::sync::RwLock::new(FxHashMap::default()),
             has_edited: false,
             overlay_compactions: 0,
             computed_overlay_bytes_estimate: 0,
@@ -3856,6 +3893,15 @@ where
         self.config.volatile_level = level;
     }
 
+    /// Set public temporal materialisation to native values or raw serials.
+    pub fn set_temporal_egress(&mut self, policy: crate::engine::TemporalEgress) {
+        self.config.temporal_egress = policy;
+    }
+
+    pub fn temporal_egress(&self) -> crate::engine::TemporalEgress {
+        self.config.temporal_egress
+    }
+
     /// Enable/disable deterministic evaluation mode (fixed clock + timezone).
     pub fn set_deterministic_mode(
         &mut self,
@@ -3966,6 +4012,7 @@ where
         // lifecycle operations do not collapse the whole FormulaPlane.
         self.demote_spans_preserving_computed_overlays(sheet_id, Region::whole_sheet(sheet_id))
             .map_err(Self::editor_error_to_excel)?;
+        self.purge_derived_formats_for_sheet(sheet_id);
         self.graph.remove_sheet(sheet_id)?;
         self.arrow_sheets.sheets.retain(|s| s.name.as_ref() != name);
         // Sheet removal can change cross-sheet refs, names, and default-sheet
@@ -4008,8 +4055,11 @@ where
             Ok(_) => {
                 self.rename_staged_formula_sheet(&old_name, new_name);
                 // Success! Invalidate cache for the moved sheet
-                let sheet_vertices: Vec<VertexId> =
-                    self.graph.vertices_in_sheet(sheet_id).collect();
+                let sheet_vertices: Vec<VertexId> = self
+                    .graph
+                    .grid_vertices_in_sheet(sheet_id)
+                    .map(|(id, _)| id)
+                    .collect();
                 for v_id in sheet_vertices {
                     self.graph.mark_vertex_dirty(v_id);
                 }
@@ -4198,12 +4248,6 @@ where
         // registry changes so their cells re-ingest and re-resolve through
         // the normal legacy path.
         self.graph.validate_define_name(name, scope)?;
-        let has_dependent_spans = !self.exact_name_dependent_span_refs([name]).is_empty();
-        if has_dependent_spans && matches!(definition, NamedDefinition::Formula { .. }) {
-            return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                "formula-name shadowing with active FormulaPlane dependents is not supported",
-            ));
-        }
         let prepared = self
             .prepare_name_dependent_span_demotion([name])
             .map_err(Self::editor_error_to_excel)?;
@@ -4899,6 +4943,7 @@ where
 
         // Mirror value-impacting graph events to Arrow for forward edits.
         // This keeps Arrow overlays (delta + computed) consistent when edits clear/commit spills.
+        self.clear_logged_cell_format_states(&new_events);
         for ev in &new_events {
             self.mirror_forward_change_to_arrow(ev);
         }
@@ -5031,6 +5076,13 @@ where
             self.apply_inverse_row_visibility_event(&item.event);
             self.apply_inverse_staged_formula_event(&item.event);
         }
+        if !batch.is_empty() {
+            let events = batch
+                .iter()
+                .map(|item| item.event.clone())
+                .collect::<Vec<_>>();
+            self.clear_logged_cell_format_states(&events);
+        }
         self.mirror_undo_batch_to_arrow(&batch);
         if !batch.is_empty() {
             for item in &batch {
@@ -5058,6 +5110,13 @@ where
         for item in &batch {
             self.apply_forward_row_visibility_event(&item.event);
             self.apply_forward_staged_formula_event(&item.event);
+        }
+        if !batch.is_empty() {
+            let events = batch
+                .iter()
+                .map(|item| item.event.clone())
+                .collect::<Vec<_>>();
+            self.clear_logged_cell_format_states(&events);
         }
         self.mirror_redo_batch_to_arrow(&batch);
         if !batch.is_empty() {
@@ -9828,22 +9887,17 @@ where
                     .get_cell_ref(vertex)
                     .and_then(|cell| engine.graph.spill_registry_anchor_for_cell(cell))
                     .unwrap_or(vertex);
-                match engine.graph.get_vertex_kind(vertex) {
-                    VertexKind::FormulaScalar | VertexKind::FormulaArray => {
-                        roots.push(TargetProducer::Legacy(vertex)).map_err(|_| {
-                            target_root_allocation_error(roots.len() + 1, request_id)
-                        })?;
-                    }
-                    VertexKind::NamedScalar
-                    | VertexKind::NamedArray
-                    | VertexKind::Range
-                    | VertexKind::InfiniteRange
-                    | VertexKind::Table => {
-                        roots.push(TargetProducer::Symbol(vertex)).map_err(|_| {
-                            target_root_allocation_error(roots.len() + 1, request_id)
-                        })?;
-                    }
-                    VertexKind::Empty | VertexKind::Cell | VertexKind::External => {}
+                // `vertices_in_region` is a sheet-index query and a sheet index holds only
+                // grid-addressed vertices, so a region can never yield a symbol: names,
+                // tables and external sources have no position for a region to cover.
+                // Symbol roots come from the by-name lookups below instead.
+                if matches!(
+                    engine.graph.get_vertex_kind(vertex),
+                    VertexKind::FormulaScalar | VertexKind::FormulaArray
+                ) {
+                    roots
+                        .push(TargetProducer::Legacy(vertex))
+                        .map_err(|_| target_root_allocation_error(roots.len() + 1, request_id))?;
                 }
             }
             if roots.len() == before
@@ -14538,6 +14592,41 @@ where
         })
     }
 
+    fn transition_off_mode_spans_to_legacy(&mut self) -> Result<bool, ExcelError> {
+        if self.config.formula_plane_mode != FormulaPlaneMode::Off {
+            return Ok(false);
+        }
+        let span_refs = self.graph.formula_authority().active_span_refs();
+        if span_refs.is_empty() {
+            return Ok(false);
+        }
+
+        let formula_dirty = self.graph.lease_formula_dirty();
+        let materialization_started = crate::instant::FzInstant::now();
+        let map_error = |phase: &str, error: FormulaSpanDemotionError| match error {
+            FormulaSpanDemotionError::Resource(error)
+            | FormulaSpanDemotionError::AstPreparation(error) => error,
+            error => ExcelError::new(ExcelErrorKind::NImpl).with_message(format!(
+                "FormulaPlane Off-mode span demotion {phase} failed: {error}"
+            )),
+        };
+        let prepared = self
+            .prepare_formula_span_demotion(&span_refs)
+            .map_err(|error| map_error("preparation", error))?;
+        let commit_started = self.preflight_evaluation_commit_window(prepared.placement_count)?;
+        let report = self
+            .commit_prepared_formula_span_demotion(prepared)
+            .map_err(|error| map_error("commit", error))?;
+        self.ack_formula_dirty_observed(formula_dirty);
+        self.observe_evaluation_commit_window(commit_started);
+        self.observe_materialization(
+            report.placements_materialized,
+            false,
+            materialization_started.elapsed(),
+        );
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_formula_span_demotion_fault_for_test(
         &mut self,
@@ -14678,6 +14767,31 @@ where
         Ok(())
     }
 
+    fn structural_row_occupancy(
+        &self,
+        sheet: &str,
+        sheet_id: SheetId,
+    ) -> crate::engine::graph::StructuralOccupancy {
+        if !self.graph.has_compressed_range_dependencies() {
+            return crate::engine::graph::StructuralOccupancy::default();
+        }
+        let mut occupancy = self.graph.structural_occupancy(sheet_id);
+        if let Some(arrow_sheet) = self.arrow_sheets.sheet(sheet) {
+            occupancy.include_arrow_sheet(arrow_sheet);
+            occupancy
+        } else {
+            // Missing Arrow state cannot prove an apparently empty column empty.
+            crate::engine::graph::StructuralOccupancy::conservative()
+        }
+    }
+
+    fn structural_column_occupancy(&self) -> crate::engine::graph::StructuralOccupancy {
+        // Arrow exposes occupied columns through chunk metadata and overlay maps,
+        // but has no cheap occupied-row index. Column edits therefore deliberately
+        // retain conservative cross-axis invalidation instead of scanning cells.
+        crate::engine::graph::StructuralOccupancy::conservative()
+    }
+
     /// Insert rows (1-based) and mirror into Arrow store when enabled
     pub fn insert_rows(
         &mut self,
@@ -14696,6 +14810,7 @@ where
         let sheet_id = self.ensure_known_sheet_id(sheet)?;
         let before0 = before.saturating_sub(1);
         let affected_region = Self::structural_row_region(sheet_id, before0);
+        let occupancy = self.structural_row_occupancy(sheet, sheet_id);
         let op = StructuralOp::InsertRows {
             sheet_id,
             before: before0,
@@ -14703,13 +14818,15 @@ where
         };
         self.demote_spans_for_structural_op(op, affected_region)?;
         let summary = {
-            let mut editor = VertexEditor::new(&mut self.graph);
+            let mut editor =
+                VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
             editor.insert_rows(sheet_id, before0, count)?
         };
         if let Some(asheet) = self.arrow_sheets.sheet_mut(sheet) {
             let before0 = before0 as usize;
             asheet.insert_rows(before0, count as usize);
         }
+        self.purge_derived_formats_after_row(sheet_id, before0);
         self.mark_moved_formula_vertices_dirty(&summary);
         self.clear_computed_overlay_after_row(sheet, before0 as usize);
         self.shift_row_visibility_insert(sheet_id, before0, count);
@@ -14736,6 +14853,7 @@ where
         let sheet_id = self.ensure_known_sheet_id(sheet)?;
         let start0 = start.saturating_sub(1);
         let affected_region = Self::structural_row_region(sheet_id, start0);
+        let occupancy = self.structural_row_occupancy(sheet, sheet_id);
         let op = StructuralOp::DeleteRows {
             sheet_id,
             start: start0,
@@ -14743,13 +14861,15 @@ where
         };
         self.demote_spans_for_structural_op(op, affected_region)?;
         let summary = {
-            let mut editor = VertexEditor::new(&mut self.graph);
+            let mut editor =
+                VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
             editor.delete_rows(sheet_id, start0, count)?
         };
         if let Some(asheet) = self.arrow_sheets.sheet_mut(sheet) {
             let start0 = start0 as usize;
             asheet.delete_rows(start0, count as usize);
         }
+        self.purge_derived_formats_after_row(sheet_id, start0);
         self.mark_moved_formula_vertices_dirty(&summary);
         self.clear_computed_overlay_after_row(sheet, start0 as usize);
         self.shift_row_visibility_delete(sheet_id, start0, count);
@@ -14781,6 +14901,7 @@ where
         )?;
         let before0 = before.saturating_sub(1);
         let affected_region = Self::structural_col_region(sheet_id, before0);
+        let occupancy = self.structural_column_occupancy();
         let op = StructuralOp::InsertColumns {
             sheet_id,
             before: before0,
@@ -14788,13 +14909,15 @@ where
         };
         self.demote_spans_for_structural_op(op, affected_region)?;
         let summary = {
-            let mut editor = VertexEditor::new(&mut self.graph);
+            let mut editor =
+                VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
             editor.insert_columns(sheet_id, before0, count)?
         };
         if let Some(asheet) = self.arrow_sheets.sheet_mut(sheet) {
             let before0 = before0 as usize;
             asheet.insert_columns(before0, count as usize);
         }
+        self.purge_derived_formats_after_col(sheet_id, before0);
         self.mark_moved_formula_vertices_dirty(&summary);
         self.clear_computed_overlay_after_col(sheet, before0 as usize);
         self.record_formula_plane_structural_change(StructuralScope::Region(affected_region));
@@ -14825,6 +14948,7 @@ where
         )?;
         let start0 = start.saturating_sub(1);
         let affected_region = Self::structural_col_region(sheet_id, start0);
+        let occupancy = self.structural_column_occupancy();
         let op = StructuralOp::DeleteColumns {
             sheet_id,
             start: start0,
@@ -14832,13 +14956,15 @@ where
         };
         self.demote_spans_for_structural_op(op, affected_region)?;
         let summary = {
-            let mut editor = VertexEditor::new(&mut self.graph);
+            let mut editor =
+                VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
             editor.delete_columns(sheet_id, start0, count)?
         };
         if let Some(asheet) = self.arrow_sheets.sheet_mut(sheet) {
             let start0 = start0 as usize;
             asheet.delete_columns(start0, count as usize);
         }
+        self.purge_derived_formats_after_col(sheet_id, start0);
         self.mark_moved_formula_vertices_dirty(&summary);
         self.clear_computed_overlay_after_col(sheet, start0 as usize);
         self.record_formula_plane_structural_change(StructuralScope::Region(affected_region));
@@ -15153,19 +15279,20 @@ where
                 ) {
                     continue;
                 }
-                let row0 = self.graph.vertex_coord(vid).row();
+                let Some(row0) = self.graph.vertex_grid_addr(vid).map(|addr| addr.row()) else {
+                    continue;
+                };
                 min_r0 = Some(min_r0.map(|m| m.min(row0)).unwrap_or(row0));
                 max_r0 = Some(max_r0.map(|m| m.max(row0)).unwrap_or(row0));
             }
         } else {
-            for vid in self.graph.vertices_in_sheet(sheet_id) {
+            for (vid, coord) in self.graph.grid_vertices_in_sheet(sheet_id) {
                 if !matches!(
                     self.graph.get_vertex_kind(vid),
                     VertexKind::FormulaScalar | VertexKind::FormulaArray
                 ) {
                     continue;
                 }
-                let coord = self.graph.vertex_coord(vid);
                 let col0 = coord.col();
                 if col0 < sc0 || col0 > ec0 {
                     continue;
@@ -15202,19 +15329,20 @@ where
                 ) {
                     continue;
                 }
-                let col0 = self.graph.vertex_coord(vid).col();
+                let Some(col0) = self.graph.vertex_grid_addr(vid).map(|addr| addr.col()) else {
+                    continue;
+                };
                 min_c0 = Some(min_c0.map(|m| m.min(col0)).unwrap_or(col0));
                 max_c0 = Some(max_c0.map(|m| m.max(col0)).unwrap_or(col0));
             }
         } else {
-            for vid in self.graph.vertices_in_sheet(sheet_id) {
+            for (vid, coord) in self.graph.grid_vertices_in_sheet(sheet_id) {
                 if !matches!(
                     self.graph.get_vertex_kind(vid),
                     VertexKind::FormulaScalar | VertexKind::FormulaArray
                 ) {
                     continue;
                 }
-                let coord = self.graph.vertex_coord(vid);
                 let row0 = coord.row();
                 if row0 < sr0 || row0 > er0 {
                     continue;
@@ -15285,6 +15413,14 @@ where
                 crate::arrow_store::OverlayValue::from_literal_value(value, asheet.date_system);
             let computed_delta = if let Some(ch) = asheet.ensure_column_chunk_mut(col0, ch_idx) {
                 let _ = ch.overlay.set(in_off, ov);
+                let format = match value {
+                    LiteralValue::Date(_) => Some(crate::format::FormatId::DATE),
+                    LiteralValue::DateTime(_) => Some(crate::format::FormatId::DATETIME),
+                    LiteralValue::Time(_) => Some(crate::format::FormatId::TIME),
+                    LiteralValue::Duration(_) => Some(crate::format::FormatId::DURATION),
+                    _ => None,
+                };
+                ch.overlay.set_format(in_off, format);
                 // A user edit must invalidate any computed (formula/spill) overlay entry at
                 // this cell. Otherwise, if the delta overlay later compacts into the base lanes
                 // (clearing `overlay`), a stale `computed_overlay=Empty` could incorrectly mask
@@ -15779,6 +15915,7 @@ where
                             asheet.insert_rows(*before0 as usize, *count as usize);
                         }
                     }
+                    self.purge_derived_formats_after_row(*sheet_id, *before0);
                 }
                 ArrowOp::InsertCols {
                     sheet_id,
@@ -15794,6 +15931,7 @@ where
                             asheet.insert_columns(*before0 as usize, *count as usize);
                         }
                     }
+                    self.purge_derived_formats_after_col(*sheet_id, *before0);
                 }
             }
         }
@@ -15893,6 +16031,145 @@ where
         );
     }
 
+    fn record_derived_format(&self, vertex_id: VertexId, format: Option<crate::format::FormatId>) {
+        if let Some(cell) = self.graph.get_cell_ref(vertex_id) {
+            self.record_derived_format_at(cell, format);
+        }
+    }
+
+    fn record_derived_format_at(&self, cell: CellRef, format: Option<crate::format::FormatId>) {
+        let mut formats = self.derived_formats.write().unwrap();
+        match format.filter(|id| *id != crate::format::FormatId::GENERAL) {
+            Some(format) => {
+                formats.insert(cell, format);
+            }
+            None => {
+                formats.remove(&cell);
+            }
+        }
+    }
+
+    fn clear_cell_format_state(&mut self, sheet: &str, cell: CellRef) {
+        self.derived_formats.write().unwrap().remove(&cell);
+        self.derived_format_results
+            .write()
+            .unwrap()
+            .retain(|vertex, _| self.graph.get_cell_ref(*vertex) != Some(cell));
+        if let Some(arrow) = self.arrow_sheets.sheet_mut(sheet) {
+            arrow.clear_format(cell.coord.row() as usize, cell.coord.col() as usize);
+        }
+    }
+
+    fn clear_logged_cell_format_states(&mut self, events: &[ChangeEvent]) {
+        let cells = events
+            .iter()
+            .filter_map(|event| match event {
+                ChangeEvent::SetValue { addr, .. } | ChangeEvent::SetFormula { addr, .. } => {
+                    Some(*addr)
+                }
+                _ => None,
+            })
+            .collect::<FxHashSet<_>>();
+        for cell in cells {
+            let sheet = self.graph.sheet_name(cell.sheet_id).to_string();
+            self.clear_cell_format_state(&sheet, cell);
+        }
+    }
+
+    fn purge_derived_formats_after_row(&mut self, sheet_id: SheetId, start0: u32) {
+        self.derived_formats
+            .write()
+            .unwrap()
+            .retain(|cell, _| cell.sheet_id != sheet_id || cell.coord.row() < start0);
+    }
+
+    fn purge_derived_formats_after_col(&mut self, sheet_id: SheetId, start0: u32) {
+        self.derived_formats
+            .write()
+            .unwrap()
+            .retain(|cell, _| cell.sheet_id != sheet_id || cell.coord.col() < start0);
+    }
+
+    fn purge_derived_formats_for_sheet(&mut self, sheet_id: SheetId) {
+        self.derived_formats
+            .write()
+            .unwrap()
+            .retain(|cell, _| cell.sheet_id != sheet_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_computed_overlay_format_0based(
+        &self,
+        sheet: &str,
+        row0: u32,
+        col0: u32,
+    ) -> Option<crate::format::FormatId> {
+        let sheet = self.arrow_sheets.sheet(sheet)?;
+        let (chunk_idx, row_in_chunk) = sheet.chunk_of_row(row0 as usize)?;
+        sheet
+            .columns
+            .get(col0 as usize)?
+            .chunk(chunk_idx)?
+            .computed_overlay
+            .get_format(row_in_chunk)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_computed_overlay_chunk_has_formats_0based(
+        &self,
+        sheet: &str,
+        row0: u32,
+        col0: u32,
+    ) -> bool {
+        let Some(sheet) = self.arrow_sheets.sheet(sheet) else {
+            return false;
+        };
+        let Some((chunk_idx, _)) = sheet.chunk_of_row(row0 as usize) else {
+            return false;
+        };
+        sheet
+            .columns
+            .get(col0 as usize)
+            .and_then(|column| column.chunk(chunk_idx))
+            .is_some_and(|chunk| chunk.computed_overlay.has_formats())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_clear_derived_format_0based(&mut self, sheet: &str, row0: u32, col0: u32) {
+        if let Some(sheet_id) = self.graph.sheet_id(sheet) {
+            self.derived_formats
+                .write()
+                .unwrap()
+                .remove(&CellRef::new_absolute(sheet_id, row0, col0));
+        }
+    }
+
+    fn write_computed_overlay_format_0based(
+        &mut self,
+        sheet: &str,
+        row0: u32,
+        col0: u32,
+        format: Option<crate::format::FormatId>,
+    ) {
+        self.ensure_arrow_sheet(sheet);
+        let (row0, col0) = (row0 as usize, col0 as usize);
+        let Some(asheet) = self.arrow_sheets.sheet_mut(sheet) else {
+            return;
+        };
+        if col0 >= asheet.columns.len() {
+            asheet.insert_columns(asheet.columns.len(), col0 + 1 - asheet.columns.len());
+        }
+        if row0 >= asheet.nrows as usize {
+            asheet.ensure_row_capacity(row0 + 1);
+        }
+        let Some((chunk, offset)) = asheet.chunk_of_row(row0) else {
+            return;
+        };
+        if let Some(chunk) = asheet.ensure_column_chunk_mut(col0, chunk) {
+            chunk.computed_overlay.set_format(offset, format);
+        }
+    }
+
     fn write_computed_overlay_value_0based(
         &mut self,
         sheet: &str,
@@ -15978,6 +16255,7 @@ where
                     row0,
                     col0,
                     value,
+                    format_id,
                 } => {
                     input_cells = input_cells.saturating_add(1);
                     self.push_computed_write_plan_entry(
@@ -15987,6 +16265,7 @@ where
                         row0,
                         col0,
                         value,
+                        format_id,
                     );
                 }
                 ComputedWrite::Rect {
@@ -15995,9 +16274,12 @@ where
                     sr0,
                     sc0,
                     values,
+                    formats,
                 } => {
-                    for (r_off, row) in values.into_iter().enumerate() {
-                        for (c_off, value) in row.into_iter().enumerate() {
+                    for (r_off, (row, format_row)) in values.into_iter().zip(formats).enumerate() {
+                        for (c_off, (value, format_id)) in
+                            row.into_iter().zip(format_row).enumerate()
+                        {
                             input_cells = input_cells.saturating_add(1);
                             self.push_computed_write_plan_entry(
                                 &mut groups,
@@ -16006,6 +16288,7 @@ where
                                 sr0.saturating_add(r_off as u32),
                                 sc0.saturating_add(c_off as u32),
                                 value,
+                                format_id,
                             );
                         }
                     }
@@ -16042,6 +16325,7 @@ where
         row0: u32,
         col0: u32,
         value: OverlayValue,
+        format_id: Option<crate::format::FormatId>,
     ) {
         let (chunk_idx, chunk_start_row0, row_in_chunk) =
             self.locate_computed_write_chunk(sheet_id, row0);
@@ -16058,6 +16342,7 @@ where
                 row_in_chunk,
                 seq,
                 value,
+                format_id,
             });
     }
 
@@ -16227,12 +16512,23 @@ where
 
     fn flush_computed_write_chunk_plan_as_points(&mut self, chunk: ComputedWriteChunkPlan) {
         let sheet_name = self.graph.sheet_name(chunk.sheet_id).to_string();
+        let formats: Vec<_> = chunk
+            .entries
+            .iter()
+            .map(|entry| (entry.row_in_chunk, entry.format_id))
+            .collect();
         for entry in chunk.entries {
             let row0 = chunk
                 .chunk_start_row0
                 .saturating_add(entry.row_in_chunk as u32);
             self.write_computed_overlay_value_0based(&sheet_name, row0, chunk.col0, entry.value);
         }
+        self.write_computed_overlay_formats_for_chunk(
+            chunk.sheet_id,
+            chunk.col0,
+            chunk.chunk_idx,
+            formats,
+        );
     }
 
     fn flush_computed_write_chunk_plan_as_sparse_fragment_or_points(
@@ -16244,6 +16540,11 @@ where
         let col0 = chunk.col0;
         let chunk_idx = chunk.chunk_idx;
         let chunk_start_row0 = chunk.chunk_start_row0;
+        let formats: Vec<_> = chunk
+            .entries
+            .iter()
+            .map(|entry| (entry.row_in_chunk, entry.format_id))
+            .collect();
         let items: Vec<(usize, OverlayValue)> = chunk
             .entries
             .into_iter()
@@ -16266,6 +16567,7 @@ where
             }
             None => {}
         }
+        self.write_computed_overlay_formats_for_chunk(sheet_id, col0, chunk_idx, formats);
     }
 
     #[inline]
@@ -16296,6 +16598,11 @@ where
             return;
         }
         let start = chunk.entries[0].row_in_chunk;
+        let formats: Vec<_> = chunk
+            .entries
+            .iter()
+            .map(|entry| (entry.row_in_chunk, entry.format_id))
+            .collect();
         let values: Vec<OverlayValue> =
             chunk.entries.into_iter().map(|entry| entry.value).collect();
         if let Some(fragment) = OverlayFragment::dense_range(start, values) {
@@ -16306,6 +16613,12 @@ where
                 fragment,
             );
         }
+        self.write_computed_overlay_formats_for_chunk(
+            chunk.sheet_id,
+            chunk.col0,
+            chunk.chunk_idx,
+            formats,
+        );
     }
 
     fn flush_computed_write_chunk_plan_as_run_fragment(&mut self, chunk: ComputedWriteChunkPlan) {
@@ -16313,6 +16626,11 @@ where
             return;
         }
         let start = chunk.entries[0].row_in_chunk;
+        let formats: Vec<_> = chunk
+            .entries
+            .iter()
+            .map(|entry| (entry.row_in_chunk, entry.format_id))
+            .collect();
         let values: Vec<OverlayValue> =
             chunk.entries.into_iter().map(|entry| entry.value).collect();
         if let Some(fragment) = OverlayFragment::run_range(start, values) {
@@ -16322,6 +16640,43 @@ where
                 chunk.chunk_idx,
                 fragment,
             );
+        }
+        self.write_computed_overlay_formats_for_chunk(
+            chunk.sheet_id,
+            chunk.col0,
+            chunk.chunk_idx,
+            formats,
+        );
+    }
+
+    fn write_computed_overlay_formats_for_chunk(
+        &mut self,
+        sheet_id: SheetId,
+        col0: u32,
+        chunk_idx: usize,
+        formats: Vec<(usize, Option<crate::format::FormatId>)>,
+    ) {
+        if !(self.config.arrow_storage_enabled
+            && self.config.delta_overlay_enabled
+            && self.config.write_formula_overlay_enabled)
+            || self.computed_overlay_mirroring_disabled
+        {
+            return;
+        }
+
+        let sheet_name = self.graph.sheet_name(sheet_id);
+        let Some(sheet) = self.arrow_sheets.sheet_mut(sheet_name) else {
+            return;
+        };
+        let Some(chunk) = sheet
+            .columns
+            .get_mut(col0 as usize)
+            .and_then(|column| column.chunk_mut(chunk_idx))
+        else {
+            return;
+        };
+        for (row_in_chunk, format_id) in formats {
+            chunk.computed_overlay.set_format(row_in_chunk, format_id);
         }
     }
 
@@ -16479,7 +16834,14 @@ where
         let date_system = self.arrow_sheet_date_system(&sheet_name);
         let ov = Self::literal_to_overlay_value(value, date_system);
         if let Some(buffer) = computed_writes {
-            buffer.push_cell(cell.sheet_id, cell.coord.row(), cell.coord.col(), ov);
+            let format_id = self.derived_formats.read().unwrap().get(&cell).copied();
+            buffer.push_cell_with_format(
+                cell.sheet_id,
+                cell.coord.row(),
+                cell.coord.col(),
+                ov,
+                format_id,
+            );
             if self.should_flush_computed_write_buffer(buffer) {
                 self.flush_computed_write_buffer(buffer)?;
             }
@@ -16591,6 +16953,7 @@ where
         )
         .map_err(Self::editor_error_to_excel)?;
         self.graph.set_cell_value(sheet, row, col, value.clone())?;
+        self.clear_cell_format_state(sheet, cell_ref);
         self.record_formula_plane_changed_cell(sheet, row, col);
         if !sheet_existed || replaced_formula {
             self.mark_topology_edited();
@@ -16864,6 +17227,7 @@ where
             ingested.dep_plan.volatile,
             ingested.dep_plan.dynamic,
         )?;
+        self.clear_cell_format_state(sheet, placement);
         self.record_formula_plane_changed_cell(sheet, row, col);
 
         // If the cell previously held a user value in the delta overlay, it must not continue
@@ -16920,6 +17284,8 @@ where
             .collect();
         let n = self.graph.bulk_set_formulas_with_plans(sheet, planned)?;
         for (row, col) in edited_cells {
+            let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+            self.clear_cell_format_state(sheet, cell);
             self.record_formula_plane_changed_cell(sheet, row, col);
         }
         // Single topology bump after batch
@@ -16938,10 +17304,137 @@ where
         }
     }
 
-    /// Get a cell value
+    fn materialize_temporal_egress(
+        value: LiteralValue,
+        class: Option<&formualizer_common::numfmt::FormatClass>,
+        policy: crate::engine::TemporalEgress,
+        date_system: crate::engine::DateSystem,
+    ) -> LiteralValue {
+        use formualizer_common::numfmt::FormatClass;
+        if policy == crate::engine::TemporalEgress::Serial {
+            return value;
+        }
+        let LiteralValue::Number(serial) = value else {
+            return value;
+        };
+        match class {
+            Some(FormatClass::Date) => {
+                formualizer_common::try_serial_to_date_for(date_system, serial)
+                    .map(LiteralValue::Date)
+                    .unwrap_or(LiteralValue::Number(serial))
+            }
+            Some(FormatClass::DateTime) => {
+                formualizer_common::try_serial_to_datetime_for(date_system, serial)
+                    .map(LiteralValue::DateTime)
+                    .unwrap_or(LiteralValue::Number(serial))
+            }
+            Some(FormatClass::Time) => {
+                let seconds = (serial.rem_euclid(1.0) * 86_400.0).round() as u32 % 86_400;
+                chrono::NaiveTime::from_num_seconds_from_midnight_opt(seconds, 0)
+                    .map(LiteralValue::Time)
+                    .unwrap_or(LiteralValue::Number(serial))
+            }
+            Some(FormatClass::Duration) => {
+                let nanos = (serial * 86_400.0 * 1_000_000_000.0).round();
+                if nanos.is_finite() && nanos >= i64::MIN as f64 && nanos <= i64::MAX as f64 {
+                    LiteralValue::Duration(chrono::Duration::nanoseconds(nanos as i64))
+                } else {
+                    LiteralValue::Number(serial)
+                }
+            }
+            _ => LiteralValue::Number(serial),
+        }
+    }
+
+    pub(crate) fn effective_format_id(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+    ) -> Option<crate::format::FormatId> {
+        let arrow = self.arrow_sheets.sheet(sheet).and_then(|arrow| {
+            arrow.format_id(
+                row.saturating_sub(1) as usize,
+                col.saturating_sub(1) as usize,
+            )
+        });
+        arrow.or_else(|| {
+            let sheet_id = self.graph.sheet_id(sheet)?;
+            let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+            self.derived_formats.read().unwrap().get(&cell).copied()
+        })
+    }
+
+    /// Get a cell value through the single temporal egress boundary.
     pub fn get_cell_value(&self, sheet: &str, row: u32, col: u32) -> Option<LiteralValue> {
-        self.read_cell_value(sheet, row, col)
-            .and_then(Self::normalize_public_cell_read)
+        let raw = self.read_cell_value(sheet, row, col)?;
+        let format = self.effective_format_id(sheet, row, col);
+        let class = format.and_then(|id| self.format_registry.class(id));
+        Self::normalize_public_cell_read(Self::materialize_temporal_egress(
+            raw,
+            class,
+            self.config.temporal_egress,
+            self.config.date_system,
+        ))
+    }
+
+    /// Read a rectangular range through the temporal egress boundary.
+    pub fn get_range_values(
+        &self,
+        sheet: &str,
+        sr: u32,
+        sc: u32,
+        er: u32,
+        ec: u32,
+    ) -> Vec<Vec<LiteralValue>> {
+        let height = er.saturating_sub(sr).saturating_add(1) as usize;
+        let width = ec.saturating_sub(sc).saturating_add(1) as usize;
+        let Some(asheet) = self.sheet_store().sheet(sheet) else {
+            return vec![vec![LiteralValue::Empty; width]; height];
+        };
+        let view = asheet.range_view(
+            sr.saturating_sub(1) as usize,
+            sc.saturating_sub(1) as usize,
+            er.saturating_sub(1) as usize,
+            ec.saturating_sub(1) as usize,
+        );
+        let sheet_id = self.graph.sheet_id(sheet);
+        let derived_formats = self.derived_formats.read().unwrap();
+        let has_derived_formats = sheet_id
+            .is_some_and(|sheet_id| derived_formats.keys().any(|cell| cell.sheet_id == sheet_id));
+        let mut out = Vec::with_capacity(height);
+        if !asheet.has_formats() && !has_derived_formats {
+            for rr in 0..height {
+                let mut row = Vec::with_capacity(width);
+                for cc in 0..width {
+                    row.push(view.get_cell(rr, cc));
+                }
+                out.push(row);
+            }
+            return out;
+        }
+        let format_registry = &self.format_registry;
+        for rr in 0..height {
+            let mut row = Vec::with_capacity(width);
+            for cc in 0..width {
+                let raw = view.get_cell(rr, cc);
+                let row0 = sr.saturating_sub(1).saturating_add(rr as u32);
+                let col0 = sc.saturating_sub(1).saturating_add(cc as u32);
+                let format = asheet.format_id(row0 as usize, col0 as usize).or_else(|| {
+                    let cell = CellRef::new(sheet_id?, Coord::new(row0, col0, true, true));
+                    derived_formats.get(&cell).copied()
+                });
+                let class = format.and_then(|id| format_registry.class(id));
+                row.push(Self::materialize_temporal_egress(
+                    raw,
+                    class,
+                    self.config.temporal_egress,
+                    self.config.date_system,
+                ));
+            }
+            out.push(row);
+        }
+        out
     }
 
     /// Unified internal read API for a single cell value (Arrow-truth).
@@ -17128,11 +17621,14 @@ where
             engine.observe_function_semantic_epoch()?;
             // A direct request selects exactly one vertex, regardless of its formula kind.
             engine.resource_checkpoint(1)?;
-            let is_formula = engine.graph.vertex_exists(vertex_id)
-                && matches!(
-                    engine.graph.get_vertex_kind(vertex_id),
-                    VertexKind::FormulaScalar | VertexKind::FormulaArray
-                );
+            if !engine.graph.vertex_exists(vertex_id) {
+                return engine.evaluate_vertex_impl(vertex_id, None);
+            }
+            engine.transition_off_mode_spans_to_legacy()?;
+            let is_formula = matches!(
+                engine.graph.get_vertex_kind(vertex_id),
+                VertexKind::FormulaScalar | VertexKind::FormulaArray
+            );
             if is_formula {
                 engine.begin_evaluation_request();
                 engine.graph.flush_pending_edge_deltas();
@@ -17245,8 +17741,17 @@ where
         // If array result, perform spill from the anchor cell
         match result {
             Ok(cv) => {
+                let derived_format = cv.format_id();
+                self.record_derived_format(vertex_id, derived_format);
                 let result_literal =
                     crate::engine::result_finalization::finalize_formula_result(cv.into_literal());
+                let output_sheet_name = sheet_name.to_string();
+                self.write_computed_overlay_format_0based(
+                    &output_sheet_name,
+                    cell_ref.coord.row(),
+                    cell_ref.coord.col(),
+                    derived_format,
+                );
                 match result_literal {
                     LiteralValue::Array(rows) => {
                         // Update kind to FormulaArray for tracking
@@ -17898,6 +18403,7 @@ where
         scope: &crate::engine::PrepareScope,
         delta: Option<&mut DeltaCollector>,
     ) -> Result<EvalResult, ExcelError> {
+        self.transition_off_mode_spans_to_legacy()?;
         if matches!(scope, crate::engine::PrepareScope::Workbook)
             && let Some(stats) = self.active_evaluation_resource_request.as_mut()
         {
@@ -18276,14 +18782,22 @@ where
                 has_dynamic_refs,
             } => {
                 let _source_cache = self.source_cache_session();
+                let transitioned = self.transition_off_mode_spans_to_legacy()?;
                 self.begin_evaluation_request();
-                if self.graph.formula_authority().active_span_count() > 0 {
+                if self.config.formula_plane_mode == FormulaPlaneMode::AuthoritativeExperimental
+                    && self.graph.formula_authority().active_span_count() > 0
+                {
                     return self.evaluate_authoritative_formula_plane_all();
                 }
                 if *has_dynamic_refs {
                     self.virtual_dep_fallback_activations =
                         self.virtual_dep_fallback_activations.saturating_add(1);
-                    return self.evaluate_all_coordinator();
+                    if !transitioned {
+                        return self.evaluate_all_coordinator();
+                    }
+                }
+                if transitioned {
+                    return self.evaluate_all_legacy_impl();
                 }
 
                 let start = crate::instant::FzInstant::now();
@@ -19681,6 +20195,419 @@ where
         })
     }
 
+    fn include_non_grid_legacy_work(
+        &self,
+        schedule: MixedSchedule,
+        vertices: &[VertexId],
+        initial_fallbacks: &[MixedScheduleFallback],
+        producer_results: &FormulaProducerResultIndex,
+        consumer_reads: &FormulaConsumerReadIndex,
+        max_candidates: usize,
+        max_edges: usize,
+    ) -> MixedSchedule {
+        if vertices.is_empty() && initial_fallbacks.is_empty() {
+            return schedule;
+        }
+
+        // Regional ordering cannot represent dynamic/virtual reads, unresolved
+        // range shapes, spill domains, or reads from multi-cell producers.
+        let mut candidate_count = 0usize;
+        let mut preflight_fallbacks = initial_fallbacks.to_vec();
+        for &vertex in vertices {
+            let producer = FormulaProducerId::Legacy(vertex);
+            let named_formula_is_dynamic =
+                self.graph
+                    .named_range_by_vertex(vertex)
+                    .is_some_and(|named| match &named.definition {
+                        crate::engine::named_range::NamedDefinition::Formula { ast, .. } => {
+                            self.graph.is_ast_dynamic(ast)
+                        }
+                        _ => false,
+                    });
+            if self.graph.is_dynamic(vertex) || named_formula_is_dynamic {
+                preflight_fallbacks.push(MixedScheduleFallback {
+                    producer,
+                    reason: MixedScheduleFallbackReason::UnsupportedProjection,
+                });
+                continue;
+            }
+
+            let context_sheet = self.graph.get_vertex_sheet_id(vertex);
+            for range in self
+                .graph
+                .get_range_dependencies(vertex)
+                .into_iter()
+                .flatten()
+            {
+                let Ok(Some(region)) = self.shared_range_to_region_pattern(range, context_sheet)
+                else {
+                    preflight_fallbacks.push(MixedScheduleFallback {
+                        producer,
+                        reason: MixedScheduleFallbackReason::UnsupportedProjection,
+                    });
+                    break;
+                };
+
+                let (rows, cols) = region.axis_ranges();
+                let (row_start, row_end) = rows.query_bounds();
+                let (col_start, col_end) = cols.query_bounds();
+                if !self
+                    .graph
+                    .spill_anchors_in_region(
+                        region.sheet_id(),
+                        row_start,
+                        col_start,
+                        row_end,
+                        col_end,
+                    )
+                    .is_empty()
+                {
+                    preflight_fallbacks.push(MixedScheduleFallback {
+                        producer,
+                        reason: MixedScheduleFallbackReason::UnsupportedProjection,
+                    });
+                    break;
+                }
+
+                let remaining = max_candidates.saturating_sub(candidate_count);
+                match producer_results.query_bounded(region, remaining) {
+                    BoundedRegionQueryResult::Incomplete { .. } => {
+                        preflight_fallbacks.push(MixedScheduleFallback {
+                            producer,
+                            reason: MixedScheduleFallbackReason::MaxCandidatesExceeded,
+                        });
+                        break;
+                    }
+                    BoundedRegionQueryResult::Complete(query) => {
+                        candidate_count = candidate_count.saturating_add(query.matches.len());
+                        if query
+                            .matches
+                            .iter()
+                            .any(|matched| matched.value.result_region.as_point().is_none())
+                        {
+                            preflight_fallbacks.push(MixedScheduleFallback {
+                                producer,
+                                reason: MixedScheduleFallbackReason::UnsupportedProjection,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !preflight_fallbacks.is_empty() {
+            let mut schedule = schedule;
+            schedule.stats.input_work_items = schedule
+                .stats
+                .input_work_items
+                .saturating_add(vertices.len())
+                .saturating_add(initial_fallbacks.len());
+            schedule.stats.consumer_candidate_count = schedule
+                .stats
+                .consumer_candidate_count
+                .saturating_add(candidate_count);
+            schedule.stats.max_candidates_exceeded_count =
+                schedule.stats.max_candidates_exceeded_count.saturating_add(
+                    preflight_fallbacks
+                        .iter()
+                        .filter(|fallback| {
+                            fallback.reason == MixedScheduleFallbackReason::MaxCandidatesExceeded
+                        })
+                        .count(),
+                );
+            schedule.fallbacks.extend(preflight_fallbacks);
+            return schedule;
+        }
+
+        let mut work_by_producer = BTreeMap::new();
+        for item in schedule
+            .layers
+            .iter()
+            .flat_map(|layer| layer.work.iter())
+            .cloned()
+        {
+            work_by_producer.insert(item.producer, item);
+        }
+        for &vertex in vertices {
+            let producer = FormulaProducerId::Legacy(vertex);
+            work_by_producer
+                .entry(producer)
+                .or_insert(FormulaProducerWork {
+                    producer,
+                    dirty: ProducerDirtyDomain::Whole,
+                });
+        }
+
+        if work_by_producer.len() > max_candidates {
+            let mut schedule = schedule;
+            schedule.stats.input_work_items = schedule
+                .stats
+                .input_work_items
+                .saturating_add(vertices.len());
+            schedule.stats.max_candidates_exceeded_count = schedule
+                .stats
+                .max_candidates_exceeded_count
+                .saturating_add(1);
+            schedule.fallbacks.push(MixedScheduleFallback {
+                producer: FormulaProducerId::Legacy(vertices[0]),
+                reason: MixedScheduleFallbackReason::MaxCandidatesExceeded,
+            });
+            return schedule;
+        }
+
+        let producer_set = work_by_producer.keys().copied().collect::<FxHashSet<_>>();
+        let mut outgoing = BTreeMap::<FormulaProducerId, BTreeSet<FormulaProducerId>>::new();
+        let mut indegree = work_by_producer
+            .keys()
+            .copied()
+            .map(|producer| (producer, 0usize))
+            .collect::<BTreeMap<_, _>>();
+        let mut derived_edges = 0usize;
+        let mut duplicate_edges = 0usize;
+        let try_add_edge = |source: FormulaProducerId,
+                            target: FormulaProducerId,
+                            outgoing: &mut BTreeMap<_, BTreeSet<_>>,
+                            indegree: &mut BTreeMap<_, usize>,
+                            derived_edges: &mut usize,
+                            duplicate_edges: &mut usize|
+         -> bool {
+            if source == target
+                || !producer_set.contains(&source)
+                || !producer_set.contains(&target)
+            {
+                return true;
+            }
+            if outgoing
+                .get(&source)
+                .is_some_and(|targets| targets.contains(&target))
+            {
+                *duplicate_edges = duplicate_edges.saturating_add(1);
+                return true;
+            }
+            if *derived_edges >= max_edges {
+                return false;
+            }
+            outgoing.entry(source).or_default().insert(target);
+            *indegree.entry(target).or_default() += 1;
+            *derived_edges = derived_edges.saturating_add(1);
+            true
+        };
+
+        let mut overflow_reason = None;
+        'regional_edges: for &source in &producer_set {
+            let Some(result_region) = producer_results.producer_result_region(source) else {
+                continue;
+            };
+            let remaining = max_candidates.saturating_sub(candidate_count);
+            let query = match consumer_reads.query_changed_region_bounded(result_region, remaining)
+            {
+                BoundedRegionQueryResult::Incomplete { .. } => {
+                    overflow_reason = Some(MixedScheduleFallbackReason::MaxCandidatesExceeded);
+                    break 'regional_edges;
+                }
+                BoundedRegionQueryResult::Complete(query) => query,
+            };
+            candidate_count = candidate_count.saturating_add(query.matches.len());
+            for matched in query.matches {
+                if !matches!(matched.value.dirty, ProjectionResult::NoIntersection)
+                    && !try_add_edge(
+                        source,
+                        matched.value.consumer,
+                        &mut outgoing,
+                        &mut indegree,
+                        &mut derived_edges,
+                        &mut duplicate_edges,
+                    )
+                {
+                    overflow_reason = Some(MixedScheduleFallbackReason::MaxEdgesExceeded);
+                    break 'regional_edges;
+                }
+            }
+        }
+
+        if overflow_reason.is_none() {
+            'legacy_edges: for &consumer in &producer_set {
+                let FormulaProducerId::Legacy(vertex) = consumer else {
+                    continue;
+                };
+                for dependency in self.graph.get_dependencies(vertex) {
+                    let direct = FormulaProducerId::Legacy(dependency);
+                    if !try_add_edge(
+                        direct,
+                        consumer,
+                        &mut outgoing,
+                        &mut indegree,
+                        &mut derived_edges,
+                        &mut duplicate_edges,
+                    ) {
+                        overflow_reason = Some(MixedScheduleFallbackReason::MaxEdgesExceeded);
+                        break 'legacy_edges;
+                    }
+
+                    if let Some(cell) = self.graph.get_cell_ref_for_vertex(dependency) {
+                        let point =
+                            Region::point(cell.sheet_id, cell.coord.row(), cell.coord.col());
+                        let remaining = max_candidates.saturating_sub(candidate_count);
+                        let query = match producer_results.query_bounded(point, remaining) {
+                            BoundedRegionQueryResult::Incomplete { .. } => {
+                                overflow_reason =
+                                    Some(MixedScheduleFallbackReason::MaxCandidatesExceeded);
+                                break 'legacy_edges;
+                            }
+                            BoundedRegionQueryResult::Complete(query) => query,
+                        };
+                        candidate_count = candidate_count.saturating_add(query.matches.len());
+                        for matched in query.matches {
+                            if !try_add_edge(
+                                matched.value.producer,
+                                consumer,
+                                &mut outgoing,
+                                &mut indegree,
+                                &mut derived_edges,
+                                &mut duplicate_edges,
+                            ) {
+                                overflow_reason =
+                                    Some(MixedScheduleFallbackReason::MaxEdgesExceeded);
+                                break 'legacy_edges;
+                            }
+                        }
+                    }
+                }
+                let context_sheet = self.graph.get_vertex_sheet_id(vertex);
+                for range in self
+                    .graph
+                    .get_range_dependencies(vertex)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Ok(Some(region)) =
+                        self.shared_range_to_region_pattern(range, context_sheet)
+                    {
+                        let remaining = max_candidates.saturating_sub(candidate_count);
+                        let query = match producer_results.query_bounded(region, remaining) {
+                            BoundedRegionQueryResult::Incomplete { .. } => {
+                                overflow_reason =
+                                    Some(MixedScheduleFallbackReason::MaxCandidatesExceeded);
+                                break 'legacy_edges;
+                            }
+                            BoundedRegionQueryResult::Complete(query) => query,
+                        };
+                        candidate_count = candidate_count.saturating_add(query.matches.len());
+                        for matched in query.matches {
+                            if !try_add_edge(
+                                matched.value.producer,
+                                consumer,
+                                &mut outgoing,
+                                &mut indegree,
+                                &mut derived_edges,
+                                &mut duplicate_edges,
+                            ) {
+                                overflow_reason =
+                                    Some(MixedScheduleFallbackReason::MaxEdgesExceeded);
+                                break 'legacy_edges;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(reason) = overflow_reason {
+            let mut schedule = schedule;
+            schedule.stats.input_work_items = schedule
+                .stats
+                .input_work_items
+                .saturating_add(vertices.len());
+            schedule.stats.consumer_candidate_count = schedule
+                .stats
+                .consumer_candidate_count
+                .saturating_add(candidate_count);
+            schedule.stats.duplicate_edges_skipped = schedule
+                .stats
+                .duplicate_edges_skipped
+                .saturating_add(duplicate_edges);
+            match reason {
+                MixedScheduleFallbackReason::MaxEdgesExceeded => {
+                    schedule.stats.max_edges_exceeded_count =
+                        schedule.stats.max_edges_exceeded_count.saturating_add(1);
+                }
+                MixedScheduleFallbackReason::MaxCandidatesExceeded => {
+                    schedule.stats.max_candidates_exceeded_count = schedule
+                        .stats
+                        .max_candidates_exceeded_count
+                        .saturating_add(1);
+                }
+                _ => unreachable!("non-grid reconstruction overflow reason is capped"),
+            }
+            schedule.fallbacks.push(MixedScheduleFallback {
+                producer: FormulaProducerId::Legacy(vertices[0]),
+                reason,
+            });
+            return schedule;
+        }
+
+        let mut ready = indegree
+            .iter()
+            .filter_map(|(&producer, &degree)| (degree == 0).then_some(producer))
+            .collect::<BTreeSet<_>>();
+        let mut layers = Vec::new();
+        let mut scheduled_count = 0usize;
+        while !ready.is_empty() {
+            let current = std::mem::take(&mut ready);
+            let mut next = BTreeSet::new();
+            let mut work = Vec::with_capacity(current.len());
+            for producer in current {
+                scheduled_count = scheduled_count.saturating_add(1);
+                work.push(
+                    work_by_producer
+                        .get(&producer)
+                        .expect("ready producer has work")
+                        .clone(),
+                );
+                for &target in outgoing.get(&producer).into_iter().flatten() {
+                    let degree = indegree.get_mut(&target).expect("edge target has indegree");
+                    *degree -= 1;
+                    if *degree == 0 {
+                        next.insert(target);
+                    }
+                }
+            }
+            layers.push(MixedLayer { work });
+            ready = next;
+        }
+
+        let mut fallbacks = schedule.fallbacks;
+        let mut stats = schedule.stats;
+        if scheduled_count != work_by_producer.len() {
+            for (&producer, &degree) in &indegree {
+                if degree != 0 {
+                    fallbacks.push(MixedScheduleFallback {
+                        producer,
+                        reason: MixedScheduleFallbackReason::CycleDetected,
+                    });
+                }
+            }
+            stats.cycle_count = stats.cycle_count.saturating_add(1);
+        }
+        stats.input_work_items = stats.input_work_items.saturating_add(vertices.len());
+        stats.merged_work_items = work_by_producer.len();
+        stats.unique_producers = work_by_producer.len();
+        stats.consumer_candidate_count = stats
+            .consumer_candidate_count
+            .saturating_add(candidate_count);
+        stats.edges_added = stats.edges_added.saturating_add(derived_edges);
+        stats.duplicate_edges_skipped = stats
+            .duplicate_edges_skipped
+            .saturating_add(duplicate_edges);
+        stats.layers = layers.len();
+        MixedSchedule {
+            layers,
+            stats,
+            fallbacks,
+        }
+    }
+
     fn build_formula_plane_mixed_schedule(
         &mut self,
         formula_dirty: &FormulaDirtyLease,
@@ -20241,6 +21168,8 @@ where
                 .collect();
             let mut work = Vec::new();
             let mut scheduled_legacy_vertices = Vec::new();
+            let mut non_grid_legacy_vertices = Vec::new();
+            let mut non_grid_legacy_fallbacks = Vec::new();
             let demanded_dirty = |producer: FormulaProducerId,
                                   dirty: ProducerDirtyDomain|
              -> Option<ProducerDirtyDomain> {
@@ -20272,11 +21201,30 @@ where
             }
             for vertex in dirty_legacy {
                 let producer = FormulaProducerId::Legacy(vertex);
-                if producer_results.producer_result_region(producer).is_some()
-                    && let Some(dirty) = demanded_dirty(producer, ProducerDirtyDomain::Whole)
-                {
-                    scheduled_legacy_vertices.push(vertex);
-                    work.push(FormulaProducerWork { producer, dirty });
+                if producer_results.producer_result_region(producer).is_some() {
+                    if let Some(dirty) = demanded_dirty(producer, ProducerDirtyDomain::Whole) {
+                        scheduled_legacy_vertices.push(vertex);
+                        work.push(FormulaProducerWork { producer, dirty });
+                    }
+                } else if matches!(
+                    self.graph.get_vertex_kind(vertex),
+                    VertexKind::NamedScalar | VertexKind::NamedArray
+                ) {
+                    if island_target_demand
+                        .as_ref()
+                        .is_none_or(|demand| demand.contains(&vertex))
+                    {
+                        // NamedScalar/NamedArray producers intentionally have no
+                        // grid result region. Keep them out of regional dirty
+                        // projection, then merge them back through graph ordering
+                        // after the regional schedule is built.
+                        non_grid_legacy_vertices.push(vertex);
+                    } else {
+                        non_grid_legacy_fallbacks.push(MixedScheduleFallback {
+                            producer,
+                            reason: MixedScheduleFallbackReason::MissingProducerResultRegion,
+                        });
+                    }
                 }
             }
 
@@ -20362,6 +21310,8 @@ where
                     }
                 }
             }
+
+            scheduled_legacy_vertices.extend(non_grid_legacy_vertices.iter().copied());
 
             let owned_dirty_events = if let Some(demand) = demand.as_ref() {
                 use crate::formula_plane::producer::compute_dirty_closure_checked;
@@ -20663,22 +21613,31 @@ where
                     span_refs_by_id.clone(),
                 ))
             })();
-            let release_result = self
-                .active_resource_ledger
-                .as_mut()
-                .map_or(Ok(()), |ledger| ledger.release_scratch(scratch))
-                .map_err(crate::engine::ResourceLedgerError::into_excel_error);
-            let (schedule, exact_strategy, pass_count, native_disk_bytes, result_span_refs) =
+            let (mut schedule, exact_strategy, pass_count, native_disk_bytes, result_span_refs) =
                 match build_result {
-                    Ok(output) => {
-                        release_result?;
-                        output
-                    }
+                    Ok(output) => output,
                     Err(error) => {
-                        let _ = release_result;
+                        if let Some(ledger) = self.active_resource_ledger.as_mut() {
+                            let _ = ledger.release_scratch(scratch);
+                        }
                         return Err(error);
                     }
                 };
+            // Keep the selected strategy's scratch reservation live while the
+            // bounded symbol merge allocates its replacement edge map.
+            schedule = self.include_non_grid_legacy_work(
+                schedule,
+                &non_grid_legacy_vertices,
+                &non_grid_legacy_fallbacks,
+                producer_results,
+                consumer_reads,
+                key.max_candidates,
+                key.max_edges,
+            );
+            self.active_resource_ledger
+                .as_mut()
+                .map_or(Ok(()), |ledger| ledger.release_scratch(scratch))
+                .map_err(crate::engine::ResourceLedgerError::into_excel_error)?;
             if let Some(strategy) = exact_strategy
                 && let Some(stats) = self.active_evaluation_resource_request.as_mut()
             {
@@ -20795,6 +21754,7 @@ where
     /// coordinator; the coordinator itself composes with private legacy
     /// primitives for legacy-only work.
     fn evaluate_all_coordinator(&mut self) -> Result<EvalResult, ExcelError> {
+        self.transition_off_mode_spans_to_legacy()?;
         self.begin_evaluation_request();
         if self.config.formula_plane_mode == FormulaPlaneMode::AuthoritativeExperimental {
             return self.evaluate_authoritative_formula_plane_all();
@@ -21009,12 +21969,15 @@ where
         &mut self,
         delta: &mut DeltaCollector,
     ) -> Result<EvalResult, ExcelError> {
-        self.begin_evaluation_request();
         let _source_cache = self.source_cache_session();
         if self.config.defer_graph_building {
             self.build_graph_all()?;
         }
-        if self.graph.formula_authority().active_span_count() > 0 {
+        self.transition_off_mode_spans_to_legacy()?;
+        self.begin_evaluation_request();
+        if self.config.formula_plane_mode == FormulaPlaneMode::AuthoritativeExperimental
+            && self.graph.formula_authority().active_span_count() > 0
+        {
             return self.evaluate_authoritative_formula_plane(None, Some(delta));
         }
         self.reset_virtual_dep_telemetry_if_disabled();
@@ -21403,7 +22366,7 @@ where
                             format!(
                                 "{}!{}{}",
                                 sheet_name,
-                                Self::col_to_letters(cell_ref.coord.col()),
+                                Self::col_to_letters(cell_ref.coord.col().saturating_add(1)),
                                 cell_ref.coord.row() + 1
                             )
                         })
@@ -21580,10 +22543,13 @@ where
             .map_err(|_| target_root_allocation_error(root_count, request_id))?;
         for region in regions {
             for vertex in self.graph.formula_vertices() {
+                let Some(position) = self.graph.vertex_grid_addr(vertex) else {
+                    continue;
+                };
                 let key = crate::formula_plane::region_index::RegionKey {
                     sheet_id: self.graph.get_vertex_sheet_id(vertex),
-                    row: self.graph.vertex_coord(vertex).row(),
-                    col: self.graph.vertex_coord(vertex).col(),
+                    row: position.row(),
+                    col: position.col(),
                 };
                 if region.contains_key(key) {
                     extended.push(TargetProducer::Legacy(vertex)).map_err(|_| {
@@ -21766,13 +22732,29 @@ where
         &mut self,
         cancel_flag: &AtomicBool,
     ) -> Result<EvalResult, ExcelError> {
-        self.begin_evaluation_request();
         let _source_cache = self.source_cache_session();
         self.validate_deterministic_mode()?;
         if self.config.defer_graph_building {
             self.build_graph_all()?;
         }
-        if self.graph.formula_authority().active_span_count() > 0 {
+        if cancel_flag.load(Ordering::Relaxed) {
+            let message = if self.config.formula_plane_mode
+                == FormulaPlaneMode::AuthoritativeExperimental
+                && self.graph.formula_authority().active_span_count() > 0
+            {
+                "Evaluation cancelled before FormulaPlane scheduling"
+            } else {
+                "Evaluation cancelled before scheduling"
+            };
+            return Err(
+                ExcelError::new(ExcelErrorKind::Cancelled).with_message(message.to_string())
+            );
+        }
+        self.transition_off_mode_spans_to_legacy()?;
+        self.begin_evaluation_request();
+        if self.config.formula_plane_mode == FormulaPlaneMode::AuthoritativeExperimental
+            && self.graph.formula_authority().active_span_count() > 0
+        {
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err(ExcelError::new(ExcelErrorKind::Cancelled).with_message(
                     "Evaluation cancelled before FormulaPlane scheduling".to_string(),
@@ -22189,6 +23171,21 @@ where
         // Only formula vertices spill dynamic arrays into the grid.
         let is_formula = matches!(kind, VertexKind::FormulaScalar | VertexKind::FormulaArray);
         if is_formula {
+            let derived_format = self
+                .derived_format_results
+                .write()
+                .unwrap()
+                .remove(&vertex_id)
+                .flatten();
+            if let Some(cell) = self.graph.get_cell_ref(vertex_id) {
+                let sheet_name = self.graph.sheet_name(cell.sheet_id).to_string();
+                self.write_computed_overlay_format_0based(
+                    &sheet_name,
+                    cell.coord.row(),
+                    cell.coord.col(),
+                    derived_format,
+                );
+            }
             match result {
                 LiteralValue::Array(rows) => {
                     self.apply_array_result_from_parallel(
@@ -22627,6 +23624,12 @@ where
         interpreter
             .evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg())
             .map(|cv| {
+                let format = cv.format_id();
+                self.derived_format_results
+                    .write()
+                    .unwrap()
+                    .insert(vertex_id, format);
+                self.record_derived_format(vertex_id, format);
                 crate::engine::result_finalization::finalize_formula_result(cv.into_literal())
             })
     }
@@ -24093,6 +25096,36 @@ where
         }
     }
 
+    fn resolve_cell_format(
+        &self,
+        sheet: Option<&str>,
+        row: u32,
+        col: u32,
+        current_sheet: &str,
+    ) -> Option<crate::format::FormatId> {
+        self.effective_format_id(sheet.unwrap_or(current_sheet), row, col)
+    }
+
+    fn format_class(
+        &self,
+        format: crate::format::FormatId,
+    ) -> Option<formualizer_common::numfmt::FormatClass> {
+        self.format_registry.class(format).cloned()
+    }
+
+    fn record_cell_derived_format(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        format: Option<crate::format::FormatId>,
+    ) {
+        if let Some(sheet_id) = self.graph.sheet_id(sheet) {
+            let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+            self.record_derived_format_at(cell, format);
+        }
+    }
+
     fn resolve_cell_reference_value(
         &self,
         sheet: Option<&str>,
@@ -24905,6 +25938,12 @@ where
                 interpreter
                     .evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg())
                     .map(|cv| {
+                        let format = cv.format_id();
+                        self.derived_format_results
+                            .write()
+                            .unwrap()
+                            .insert(vertex_id, format);
+                        self.record_derived_format(vertex_id, format);
                         crate::engine::result_finalization::finalize_formula_result(
                             cv.into_literal(),
                         )
@@ -26265,13 +27304,16 @@ where
         log: &mut ChangeLog,
     ) -> Result<EvalResult, ExcelError> {
         self.observe_function_semantic_epoch()?;
-        self.begin_evaluation_request();
         let _source_cache = self.source_cache_session();
         self.validate_deterministic_mode()?;
         if self.config.defer_graph_building {
             self.build_graph_all()?;
         }
-        if self.graph.formula_authority().active_span_count() > 0 {
+        self.transition_off_mode_spans_to_legacy()?;
+        self.begin_evaluation_request();
+        if self.config.formula_plane_mode == FormulaPlaneMode::AuthoritativeExperimental
+            && self.graph.formula_authority().active_span_count() > 0
+        {
             return self.evaluate_authoritative_formula_plane_all();
         }
         self.reset_virtual_dep_telemetry_if_disabled();
