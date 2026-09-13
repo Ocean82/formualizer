@@ -59,6 +59,24 @@ Formualizer combines broad Excel-compatible formula support with Arrow-backed st
 - **SaaS products** embedding spreadsheet logic — pricing calculators, planning tools, configurators — without shipping a full spreadsheet UI.
 - **Data engineers** extracting business logic trapped in spreadsheets into reproducible, testable pipelines.
 
+## Building an AI agent? Use agent-spreadsheet
+
+Formualizer is the **engine**. If you want an agent to *work with* workbooks — read, profile, edit, recalculate, diff, and verify them safely — use **[agent-spreadsheet](https://github.com/PSU3D0/agent-spreadsheet)**, the official agent tooling layer built on this engine:
+
+```
+your agent / app
+      │
+agent-spreadsheet     CLI (`agent-spreadsheet` / `asp`) · MCP server · JS SDK
+      │
+  formualizer         parsing · dependency graph · 400+ functions · recalc
+```
+
+- **CLI** — stateless one-shot reads, safe edits, recalc, and verifiable diffs for shell-native agents and CI (`npm i -g agent-spreadsheet` or `cargo install agent-spreadsheet`)
+- **MCP server** — stateful multi-turn sessions with workbook forks, checkpoints, staged edits, and native recalculation (no LibreOffice fallback)
+- **JS SDK** — typed API for app integrations, backed by the MCP server or an embedded in-process WASM engine
+
+Unlike screenshot-driven UI automation or MCP servers that can't compute a formula, agent-spreadsheet evaluates the actual workbook with this engine — every edit is recalculated, traceable, and diffable.
+
 ## Quick start
 
 ### Rust
@@ -261,7 +279,7 @@ Formal benchmarks are in progress.
 |--------|---------|------|
 | Rust | `cargo add formualizer` | [docs.rs](https://docs.rs/formualizer) · [guide](https://www.formualizer.dev/docs/quickstarts/rust-quickstart) |
 | Python | `pip install formualizer` | [README](bindings/python/README.md) · [guide](https://www.formualizer.dev/docs/quickstarts/python-quickstart) |
-| Python (Pyodide) | `await micropip.install("formualizer")` | [README](bindings/python/README.md#using-in-pyodide-browser--webassembly) · [guide](https://www.formualizer.dev/docs/quickstarts/pyodide-quickstart) |
+| Python (Pyodide) | `await micropip.install(wheel_url)` (compatible wheel URL) | [README](bindings/python/README.md#using-in-pyodide-browser--webassembly) · [guide](https://www.formualizer.dev/docs/quickstarts/pyodide-quickstart) |
 | WASM | `npm install formualizer` | [README](bindings/wasm/README.md) · [guide](https://www.formualizer.dev/docs/quickstarts/js-wasm-quickstart) |
 
 Both Python and WASM bindings expose the same core API surface: tokenization, parsing, workbook operations, evaluation, undo/redo, and SheetPort.

@@ -106,14 +106,10 @@ fn range_key_from_shared(
         },
         _ => RangeKey::OpenRect {
             sheet,
-            start: range
-                .start_row
-                .zip(range.start_col)
-                .map(|(r, c)| AbsCoord::new(r.index, c.index)),
-            end: range
-                .end_row
-                .zip(range.end_col)
-                .map(|(r, c)| AbsCoord::new(r.index, c.index)),
+            start_row: range.start_row.map(|bound| bound.index),
+            start_col: range.start_col.map(|bound| bound.index),
+            end_row: range.end_row.map(|bound| bound.index),
+            end_col: range.end_col.map(|bound| bound.index),
         },
     }
 }
@@ -354,6 +350,8 @@ impl<'g> BulkIngestBuilder<'g> {
                 .map_err(crate::engine::ResourceLedgerError::into_excel_error)?;
         }
 
+        let had_vertices = self.g.vertex_count() != 0;
+        let mut dirty_roots = Vec::new();
         let mut total_vertices = 0usize;
         let mut total_formulas = 0usize;
         let mut total_edges = 0usize;
@@ -368,7 +366,7 @@ impl<'g> BulkIngestBuilder<'g> {
         // Materialize per-sheet to keep caches warm and reduce cross-sheet churn
         // Accumulate a flat adjacency for a single-shot CSR build
         let mut edges_adj: Vec<(u32, Vec<u32>)> = Vec::new();
-        let mut coord_accum: Vec<AbsCoord> = Vec::new();
+        let mut coord_accum: Vec<crate::engine::addr::VertexAddr> = Vec::new();
         let mut id_accum: Vec<u32> = Vec::new();
         for (_sid, mut stage) in self.sheets.drain() {
             let t_sheet0 = Instant::now();
@@ -521,6 +519,9 @@ impl<'g> BulkIngestBuilder<'g> {
                         }
                     }
                     self.g.mark_vertices_dirty_batch(&target_vids);
+                    if had_vertices {
+                        dirty_roots.extend_from_slice(&target_vids);
+                    }
                     total_formulas += target_vids.len();
                     t_assign_ms += ta0.elapsed().as_millis();
 
@@ -660,13 +661,21 @@ impl<'g> BulkIngestBuilder<'g> {
             } else {
                 // One-shot CSR build from accumulated adjacency and coords/ids
                 let mut t_coords_ms = 0u128;
-                if coord_accum.is_empty() || id_accum.is_empty() {
+                // Allocation batches contain only vertices created by this ingest,
+                // not necessarily the complete graph (including symbol vertices).
+                // Keep the complete initial-load fast path, but never install partial
+                // membership: later rebuilds use it to carry untouched edges forward.
+                // vertex_count includes deleted slots, which can only cause a safe
+                // extra collection here; each accumulated id is newly allocated once.
+                if id_accum.len() != total_vertices_now {
+                    coord_accum.clear();
+                    id_accum.clear();
                     if dbg {
                         eprintln!("[fz][ingest] finalize: gathering coords/ids");
                     }
                     let t_coords0 = Instant::now();
                     for vid in self.g.iter_vertex_ids() {
-                        coord_accum.push(self.g.vertex_coord(vid));
+                        coord_accum.push(self.g.vertex_addr(vid));
                         id_accum.push(vid.0);
                     }
                     t_coords_ms = t_coords0.elapsed().as_millis();
@@ -687,6 +696,13 @@ impl<'g> BulkIngestBuilder<'g> {
                     );
                 }
             }
+        }
+
+        // Replacing a formula also invalidates its existing consumers. Do this
+        // once, after all new edges are installed, rather than one BFS per row.
+        // On a complete first load every formula is already dirty.
+        if !dirty_roots.is_empty() {
+            self.g.mark_dirty_many(&dirty_roots);
         }
 
         // Restore config

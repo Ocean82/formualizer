@@ -448,7 +448,21 @@ fn binding_value_to_js(value: BindingValue) -> JsValue {
 }
 
 pub(crate) fn literal_to_js(value: &formualizer::LiteralValue) -> JsValue {
-    binding_value_to_js(binding_value(value))
+    match value {
+        formualizer::LiteralValue::Date(date) => {
+            let milliseconds = date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
+            js_sys::Date::new(&JsValue::from_f64(milliseconds as f64)).into()
+        }
+        formualizer::LiteralValue::DateTime(datetime) => {
+            let milliseconds = datetime.and_utc().timestamp_millis();
+            js_sys::Date::new(&JsValue::from_f64(milliseconds as f64)).into()
+        }
+        _ => binding_value_to_js(binding_value(value)),
+    }
 }
 
 fn set(obj: &js_sys::Object, key: &str, value: JsValue) -> Result<(), JsValue> {
@@ -1085,6 +1099,22 @@ impl Workbook {
         })
     }
 
+    /// Choose temporal output as native JS dates (default) or numeric serials.
+    #[wasm_bindgen(js_name = "setTemporalEgress")]
+    pub fn set_temporal_egress(&self, policy: String) -> Result<(), JsValue> {
+        let policy = match policy.to_ascii_lowercase().as_str() {
+            "native" => formualizer::eval::engine::TemporalEgress::Native,
+            "serial" => formualizer::eval::engine::TemporalEgress::Serial,
+            _ => return Err(js_error("temporal egress must be 'native' or 'serial'")),
+        };
+        self.inner
+            .write()
+            .map_err(|_| js_error("failed to lock workbook for write"))?
+            .engine_mut()
+            .set_temporal_egress(policy);
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = "setValue")]
     pub fn set_value(
         &self,
@@ -1354,6 +1384,12 @@ impl Workbook {
             &obj,
             "nanConverged",
             JsValue::from_f64(t.nan_converged as f64),
+        )?;
+        set(&obj, "reusedSccs", JsValue::from_f64(t.reused_sccs as f64))?;
+        set(
+            &obj,
+            "reusedSccMembers",
+            JsValue::from_f64(t.reused_scc_members as f64),
         )?;
         // u128 -> u64 saturation mirrors the Python binding; the u64 -> f64
         // conversion is then lossless for any realistic duration.

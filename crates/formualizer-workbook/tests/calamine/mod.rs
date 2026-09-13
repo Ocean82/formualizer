@@ -5,6 +5,10 @@ mod common;
 #[cfg(feature = "calamine")]
 mod calcpr;
 #[cfg(feature = "calamine")]
+mod criteria_ingest_blank;
+#[cfg(feature = "calamine")]
+mod criteria_wildcard_parity;
+#[cfg(feature = "calamine")]
 mod date_arithmetic;
 #[cfg(feature = "calamine")]
 mod dates;
@@ -12,6 +16,8 @@ mod dates;
 mod deltas;
 #[cfg(feature = "calamine")]
 mod engine;
+#[cfg(feature = "calamine")]
+mod format_channel;
 #[cfg(feature = "calamine")]
 mod formulas;
 #[cfg(feature = "calamine")]
@@ -36,3 +42,5 @@ mod semantic_epoch_replay;
 mod shared_formulas;
 #[cfg(feature = "calamine")]
 mod sheet_load;
+#[cfg(feature = "umya")]
+mod temporal_roundtrip;
