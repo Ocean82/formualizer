@@ -1,6 +1,12 @@
-# Fork-only: publishes @ocean8219/formualizer using NPM_TOKEN.
+# Fork-only: publishes @ocean8219/formualizer via npm Trusted Publishing (OIDC).
 # Prefer this over upstream npm-publish.yml / release.yml for the scoped package.
 # workflow_dispatch must live on the default branch (main).
+#
+# Configure once on npmjs.com → package @ocean8219/formualizer → Trusted Publisher:
+#   Organization/user: Ocean82
+#   Repository:        formualizer
+#   Workflow filename: npm-publish-scoped.yml
+#   Environment:       (leave blank unless you add one)
 name: Publish scoped npm
 
 on:
@@ -17,6 +23,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -66,6 +73,4 @@ jobs:
 
       - name: Publish to npm
         working-directory: ${{ inputs.package_dir }}
-        run: npm publish --ignore-scripts --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --ignore-scripts --access public --provenance
